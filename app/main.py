@@ -83,7 +83,9 @@ def extract_intel(text: str) -> Dict[str, Any]:
     """Extract URLs, UPI IDs, IFSC codes, and bank account-like numbers."""
     found: Dict[str, Any] = {}
 
+    # URLs (strip trailing punctuation like '.', ',', ')', ']' etc.)
     urls = re.findall(r"https?://[^\s]+", text, flags=re.IGNORECASE)
+    urls = [u.rstrip(".,)]}!?;:") for u in urls]
     if urls:
         found["urls"] = urls
 
@@ -92,6 +94,7 @@ def extract_intel(text: str) -> Dict[str, Any]:
     if upis:
         found["upi_ids"] = upis
 
+    # IFSC
     ifsc = re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", text.upper())
     if ifsc:
         found["ifsc"] = ifsc
@@ -189,6 +192,7 @@ def get_session(session_id: str):
         "history": SESSIONS.get(session_id, []),
         "intel": INTEL.get(session_id, {"urls": [], "upi_ids": [], "ifsc": [], "account_numbers": []}),
     }
+
 
 @app.post("/reset")
 def reset_all():
