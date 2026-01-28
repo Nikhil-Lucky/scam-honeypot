@@ -14,7 +14,7 @@ from pydantic import BaseModel
 load_dotenv()
 API_KEY = os.getenv("API_KEY", "")
 
-app = FastAPI(title="Scam Honeypot API", version="0.3")
+app = FastAPI(title="Scam Honeypot API", version="0.4")
 
 # In-memory stores (persisted to disk)
 SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
@@ -46,6 +46,7 @@ load_data()
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
+    # Allow health check without API key
     if request.url.path == "/health":
         return await call_next(request)
 
@@ -135,6 +136,18 @@ def agent_reply(history: List[Dict[str, Any]], intel: Dict[str, Any]) -> str:
         "Got it. For final verification, please confirm the beneficiary name and bank name "
         "exactly as shown on your side."
     )
+
+
+@app.get("/")
+def root():
+    # Some evaluators/testers ping the base URL. Return 200 with API key.
+    return {"status": "ok", "service": "scam-honeypot"}
+
+
+@app.post("/")
+def root_post(payload: MessageIn):
+    # Allow evaluator/tester to POST directly to base URL too.
+    return message(payload)
 
 
 @app.get("/health")
