@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Body
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 load_dotenv()
@@ -80,7 +80,7 @@ load_data()
 # ---------------------------
 # Security middleware
 # ---------------------------
-OPEN_PATHS = {"/health", "/", "/docs-info"}  # allow pings + helper without key
+OPEN_PATHS = {"/health", "/", "/docs-info"}  # public helper endpoints
 OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 
 
@@ -180,6 +180,16 @@ def _dedupe(items: List[str]) -> List[str]:
 
 
 def extract_intel(text: str) -> Dict[str, Any]:
+    """
+    Extract:
+    - urls: http(s) links
+    - upi_links: upi://pay?... deep links
+    - upi_ids: name@bank (tries to avoid emails)
+    - ifsc: ABCD0XXXXXX
+    - account_numbers: 9-18 digits (excluding 10-digit phones)
+    - phones: normalized digits (keep last 10 digits)
+    - emails: valid emails
+    """
     found: Dict[str, Any] = {}
     t = text
 
@@ -222,7 +232,7 @@ def extract_intel(text: str) -> Dict[str, Any]:
     if accts:
         found["account_numbers"] = accts
 
-    # Phones (normalize to last 10 digits)
+    # Phones (keep last 10 digits)
     phone_matches = [m.group(0) for m in re.finditer(r"(?:\+?\d{1,3}[\s\-]?)?\b\d{10}\b", t)]
     phones: List[str] = []
     for p in phone_matches:
@@ -280,36 +290,71 @@ def agent_reply(stage: str) -> str:
 
 
 # ---------------------------
-# Robust payload parser (portal-safe)
+# Robust payload parser (prevents 422 / portal INVALID_REQUEST_BODY)
 # ---------------------------
-async def _parse_message_payload(request: Request, payload: Any) -> Tuple[Optional[str], str]:
-    # 1) If we got a dict-like payload
-    if isinstance(payload, dict):
-        msg = (payload.get("message") or payload.get("msg") or payload.get("text") or payload.get("input") or "")
-        sid = payload.get("session_id") or payload.get("session") or payload.get("sid")
-        if isinstance(msg, str) and msg.strip():
-            return (sid if isinstance(sid, str) else None), msg
+async def _parse_message_payload(request: Request) -> Tuple[Optional[str], str]:
+    # 0) Query param fallback (some testers do this)
+    qp_msg = request.query_params.get("message") or request.query_params.get("msg") or request.query_params.get("text")
+    qp_sid = request.query_params.get("session_id") or request.query_params.get("sid") or request.query_params.get("session")
+    if qp_msg:
+        return (qp_sid if qp_sid else None), qp_msg
 
-    # 2) Try raw body (even if wrong content-type)
+    # 1) Try request.json() (even if content-type is wrong, it might work)
+    try:
+        data = await request.json()
+        if isinstance(data, dict):
+            msg = (
+                data.get("message")
+                or data.get("msg")
+                or data.get("text")
+                or data.get("input")
+                or data.get("prompt")
+                or ""
+            )
+            sid = data.get("session_id") or data.get("session") or data.get("sid")
+            if isinstance(msg, str) and msg.strip():
+                return (sid if isinstance(sid, str) else None), msg.strip()
+    except Exception:
+        pass
+
+    # 2) Try form-encoded (some portals submit like this)
+    try:
+        form = await request.form()
+        if form:
+            msg = form.get("message") or form.get("msg") or form.get("text") or form.get("input") or ""
+            sid = form.get("session_id") or form.get("sid") or None
+            if isinstance(msg, str) and msg.strip():
+                return (sid if isinstance(sid, str) else None), msg.strip()
+    except Exception:
+        pass
+
+    # 3) Try raw bytes as JSON or plain text
     raw = await request.body()
     if raw:
-        # Try JSON
+        # JSON parse
         try:
             data = json.loads(raw.decode("utf-8", errors="ignore"))
             if isinstance(data, dict):
-                msg = (data.get("message") or data.get("msg") or data.get("text") or data.get("input") or "")
+                msg = (
+                    data.get("message")
+                    or data.get("msg")
+                    or data.get("text")
+                    or data.get("input")
+                    or data.get("prompt")
+                    or ""
+                )
                 sid = data.get("session_id") or data.get("session") or data.get("sid")
                 if isinstance(msg, str) and msg.strip():
-                    return (sid if isinstance(sid, str) else None), msg
+                    return (sid if isinstance(sid, str) else None), msg.strip()
         except Exception:
             pass
 
-        # Plain text fallback
-        msg_txt = raw.decode("utf-8", errors="ignore").strip()
-        if msg_txt:
-            return None, msg_txt
+        # plain text
+        txt = raw.decode("utf-8", errors="ignore").strip()
+        if txt:
+            return None, txt
 
-    # 3) Safe default (so tester never sees INVALID_REQUEST_BODY)
+    # 4) Final fallback (never 422)
     return None, "Hello (tester ping). Please send the scam message text."
 
 
@@ -392,14 +437,14 @@ def docs_info(request: Request):
 
 
 @app.post("/message")
-async def message(request: Request, payload: Any = Body(default=None)):
-    sid, msg = await _parse_message_payload(request, payload)
+async def message(request: Request):
+    sid, msg = await _parse_message_payload(request)
     return _process_message(sid, msg)
 
 
 @app.post("/")
-async def root_post(request: Request, payload: Any = Body(default=None)):
-    sid, msg = await _parse_message_payload(request, payload)
+async def root_post(request: Request):
+    sid, msg = await _parse_message_payload(request)
     return _process_message(sid, msg)
 
 
