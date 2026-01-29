@@ -10,7 +10,6 @@ from typing import Dict, List, Any, Optional, Tuple
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Body
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY", "")
@@ -112,14 +111,6 @@ async def api_key_middleware(request: Request, call_next):
 
 
 # ---------------------------
-# Models
-# ---------------------------
-class MessageIn(BaseModel):
-    session_id: Optional[str] = None
-    message: str
-
-
-# ---------------------------
 # Scam detection + risk scoring
 # ---------------------------
 KEYWORDS = {
@@ -192,39 +183,46 @@ def extract_intel(text: str) -> Dict[str, Any]:
     found: Dict[str, Any] = {}
     t = text
 
+    # URLs
     urls = re.findall(r"https?://[^\s]+", t, flags=re.IGNORECASE)
     urls = _dedupe([u.rstrip(".,)]}!?;:") for u in urls])
     if urls:
         found["urls"] = urls
 
+    # UPI deep links
     upi_links = re.findall(r"\bupi://pay\?[^\s]+", t, flags=re.IGNORECASE)
     upi_links = _dedupe([u.rstrip(".,)]}!?;:") for u in upi_links])
     if upi_links:
         found["upi_links"] = upi_links
 
+    # Emails
     emails = _dedupe(re.findall(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", t))
     if emails:
         found["emails"] = emails
 
+    # UPI IDs (avoid emails by disallowing '.' in bank part)
     candidates = re.findall(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_]{2,}\b", t)
     upis: List[str] = []
     for c in candidates:
         bank_part = c.split("@", 1)[1]
-        if "." not in bank_part:  # avoid emails
+        if "." not in bank_part:
             upis.append(c)
     upis = _dedupe(upis)
     if upis:
         found["upi_ids"] = upis
 
+    # IFSC
     ifsc = _dedupe(re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", t.upper()))
     if ifsc:
         found["ifsc"] = ifsc
 
+    # Account numbers (exclude 10-digit phones)
     num_candidates = re.findall(r"\b\d{9,18}\b", t)
-    accts = _dedupe([c for c in num_candidates if len(c) != 10])  # exclude 10-digit phones
+    accts = _dedupe([c for c in num_candidates if len(c) != 10])
     if accts:
         found["account_numbers"] = accts
 
+    # Phones (normalize to last 10 digits)
     phone_matches = [m.group(0) for m in re.finditer(r"(?:\+?\d{1,3}[\s\-]?)?\b\d{10}\b", t)]
     phones: List[str] = []
     for p in phone_matches:
@@ -282,41 +280,77 @@ def agent_reply(stage: str) -> str:
 
 
 # ---------------------------
-# Robust payload parser (FIXES portal INVALID_REQUEST_BODY)
+# Robust payload parser (portal-safe)
 # ---------------------------
-async def _parse_message_payload(request: Request, payload: Optional[MessageIn]) -> Tuple[Optional[str], str]:
-    # 1) If FastAPI successfully parsed MessageIn, use it
-    if payload is not None and payload.message:
-        return payload.session_id, payload.message
+async def _parse_message_payload(request: Request, payload: Any) -> Tuple[Optional[str], str]:
+    # 1) If we got a dict-like payload
+    if isinstance(payload, dict):
+        msg = (payload.get("message") or payload.get("msg") or payload.get("text") or payload.get("input") or "")
+        sid = payload.get("session_id") or payload.get("session") or payload.get("sid")
+        if isinstance(msg, str) and msg.strip():
+            return (sid if isinstance(sid, str) else None), msg
 
-    # 2) Try JSON (even if Content-Type is wrong)
+    # 2) Try raw body (even if wrong content-type)
     raw = await request.body()
     if raw:
         # Try JSON
         try:
             data = json.loads(raw.decode("utf-8", errors="ignore"))
             if isinstance(data, dict):
-                # Accept multiple possible keys
-                msg = (
-                    data.get("message")
-                    or data.get("msg")
-                    or data.get("text")
-                    or data.get("input")
-                    or ""
-                )
+                msg = (data.get("message") or data.get("msg") or data.get("text") or data.get("input") or "")
                 sid = data.get("session_id") or data.get("session") or data.get("sid")
                 if isinstance(msg, str) and msg.strip():
                     return (sid if isinstance(sid, str) else None), msg
         except Exception:
             pass
 
-        # 3) If not JSON, treat raw as plain-text message
+        # Plain text fallback
         msg_txt = raw.decode("utf-8", errors="ignore").strip()
         if msg_txt:
             return None, msg_txt
 
-    # 4) Fallback: don’t fail portal tester; use a safe default message
+    # 3) Safe default (so tester never sees INVALID_REQUEST_BODY)
     return None, "Hello (tester ping). Please send the scam message text."
+
+
+def _process_message(session_id: Optional[str], message_text: str) -> Dict[str, Any]:
+    sid = session_id or str(uuid.uuid4())
+
+    history = SESSIONS.setdefault(sid, [])
+    intel = INTEL.setdefault(
+        sid,
+        {"urls": [], "upi_links": [], "upi_ids": [], "ifsc": [], "account_numbers": [], "phones": [], "emails": []},
+    )
+
+    history.append({"ts": datetime.utcnow().isoformat(), "from": "scammer", "text": message_text})
+
+    new_found = extract_intel(message_text)
+    for k, v in new_found.items():
+        if isinstance(v, list):
+            merge_unique_list(intel, k, v)
+
+    prev = int(RISK_STATE.get(sid, 0))
+    risk = analyze_risk(message_text, prev)
+    RISK_STATE[sid] = int(risk["total_score"])
+
+    is_scam = detect_scam_from_risk(risk)
+    stage = compute_stage(intel) if is_scam else "passive"
+
+    reply = agent_reply(stage) if is_scam else "Hello. Please share the transaction reference so I can verify your payment."
+    history.append({"ts": datetime.utcnow().isoformat(), "from": "bot", "text": reply})
+
+    save_data()
+
+    return {
+        "session_id": sid,
+        "reply": reply,
+        "turns": len(history),
+        "scam_detected": is_scam,
+        "handoff_to_agent": is_scam,
+        "stage": stage,
+        "intel": intel,
+        "risk": risk,
+    }
 
 
 # ---------------------------
@@ -357,55 +391,14 @@ def docs_info(request: Request):
     }
 
 
-def _process_message(session_id: Optional[str], message_text: str) -> Dict[str, Any]:
-    sid = session_id or str(uuid.uuid4())
-
-    history = SESSIONS.setdefault(sid, [])
-    intel = INTEL.setdefault(
-        sid,
-        {"urls": [], "upi_links": [], "upi_ids": [], "ifsc": [], "account_numbers": [], "phones": [], "emails": []},
-    )
-
-    history.append({"ts": datetime.utcnow().isoformat(), "from": "scammer", "text": message_text})
-
-    new_found = extract_intel(message_text)
-    for k, v in new_found.items():
-        if isinstance(v, list):
-            merge_unique_list(intel, k, v)
-
-    prev = int(RISK_STATE.get(sid, 0))
-    risk = analyze_risk(message_text, prev)
-    RISK_STATE[sid] = int(risk["total_score"])
-
-    is_scam = detect_scam_from_risk(risk)
-    stage = compute_stage(intel) if is_scam else "passive"
-
-    reply = agent_reply(stage) if is_scam else "Hello. Please share the transaction reference so I can verify your payment."
-
-    history.append({"ts": datetime.utcnow().isoformat(), "from": "bot", "text": reply})
-
-    save_data()
-
-    return {
-        "session_id": sid,
-        "reply": reply,
-        "turns": len(history),
-        "scam_detected": is_scam,
-        "handoff_to_agent": is_scam,
-        "stage": stage,
-        "intel": intel,
-        "risk": risk,
-    }
-
-
 @app.post("/message")
-async def message(request: Request, payload: Optional[MessageIn] = Body(default=None)):
+async def message(request: Request, payload: Any = Body(default=None)):
     sid, msg = await _parse_message_payload(request, payload)
     return _process_message(sid, msg)
 
 
 @app.post("/")
-async def root_post(request: Request, payload: Optional[MessageIn] = Body(default=None)):
+async def root_post(request: Request, payload: Any = Body(default=None)):
     sid, msg = await _parse_message_payload(request, payload)
     return _process_message(sid, msg)
 
