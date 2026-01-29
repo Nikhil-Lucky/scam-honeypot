@@ -4,44 +4,52 @@ import uuid
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# Suhas risk scoring module
+# Suhas risk scoring module (make sure app/scam_detector.py exists)
 from .scam_detector import analyze_message, THRESHOLD
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY", "")
 
-app = FastAPI(title="Scam Honeypot API", version="0.6")
+app = FastAPI(title="Scam Honeypot API", version="0.7")
 
 # In-memory stores (persisted to disk)
 SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
-INTEL: Dict[str, Dict[str, Any]] = {}   # session_id -> extracted intel
-SCORES: Dict[str, int] = {}             # session_id -> total risk score
+INTEL: Dict[str, Dict[str, Any]] = {}     # session_id -> extracted intel
+SCORES: Dict[str, int] = {}               # session_id -> total risk score
+STAGES: Dict[str, str] = {}               # session_id -> current stage
 DATA_FILE = Path("data.json")
 
 
 def load_data():
-    global SESSIONS, INTEL, SCORES
+    global SESSIONS, INTEL, SCORES, STAGES
     if DATA_FILE.exists():
         try:
             data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
             SESSIONS = data.get("sessions", {}) or {}
             INTEL = data.get("intel", {}) or {}
             SCORES = data.get("scores", {}) or {}
+            STAGES = data.get("stages", {}) or {}
         except Exception:
             SESSIONS = {}
             INTEL = {}
             SCORES = {}
+            STAGES = {}
 
 
 def save_data():
-    data = {"sessions": SESSIONS, "intel": INTEL, "scores": SCORES}
+    data = {
+        "sessions": SESSIONS,
+        "intel": INTEL,
+        "scores": SCORES,
+        "stages": STAGES,
+    }
     DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -62,7 +70,7 @@ async def api_key_middleware(request: Request, call_next):
 
 
 class MessageIn(BaseModel):
-    session_id: str | None = None
+    session_id: Optional[str] = None
     message: str
 
 
@@ -102,13 +110,16 @@ def extract_intel(text: str) -> Dict[str, Any]:
     if upi_links:
         found["upi_links"] = upi_links
 
-    # UPI IDs (name@bank)
+    # Emails
+    emails = re.findall(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}\b", t)
+    if emails:
+        found["emails"] = emails
+
+    # UPI IDs (name@bank) — filter out emails by ensuring bank part has no dot
     candidates = re.findall(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9.\-_]{2,}\b", t)
-    # Keep only UPI-like handles (bank part should NOT contain a dot like .com)
     upis = [c for c in candidates if "." not in c.split("@", 1)[1]]
     if upis:
         found["upi_ids"] = upis
-
 
     # IFSC
     ifsc = re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", t.upper())
@@ -126,41 +137,61 @@ def extract_intel(text: str) -> Dict[str, Any]:
     if phones:
         found["phones"] = phones
 
-    # Emails
-    emails = re.findall(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}\b", t)
-    if emails:
-        found["emails"] = emails
-
     return found
 
 
-def agent_reply(history: List[Dict[str, Any]], intel: Dict[str, Any]) -> str:
+def compute_stage(intel: Dict[str, Any]) -> str:
     """
-    Simple multi-turn agent:
-    - If no intel yet: ask for UPI id or account+IFSC.
-    - If got UPI/acct+ifsc but no link: ask for payment link/QR.
-    - If got link: ask for beneficiary name and bank details.
+    Stage machine (simple + robust):
+    1) need_beneficiary_details  -> ask UPI OR account+IFSC
+    2) need_link                 -> ask payment link/QR/upi://pay link
+    3) need_beneficiary_confirm  -> ask beneficiary name + bank name
     """
     have_upi = bool(intel.get("upi_ids"))
-    have_link = bool(intel.get("urls") or intel.get("upi_links"))
     have_acct = bool(intel.get("account_numbers"))
     have_ifsc = bool(intel.get("ifsc"))
+    have_pay_id = have_upi or (have_acct and have_ifsc)
 
-    if not (have_upi or (have_acct and have_ifsc)):
+    have_link = bool(intel.get("urls")) or bool(intel.get("upi_links"))
+
+    if not have_pay_id:
+        return "need_beneficiary_details"
+    if have_pay_id and not have_link:
+        return "need_link"
+    return "need_beneficiary_confirm"
+
+
+def agent_reply_for_stage(stage: str, intel: Dict[str, Any]) -> str:
+    if stage == "need_beneficiary_details":
         return (
             "I can help verify, but I need the beneficiary details. "
             "Please share the UPI ID (example: name@bank) OR bank account number + IFSC."
         )
-
-    if (have_upi or (have_acct and have_ifsc)) and not have_link:
+    if stage == "need_link":
         return (
-            "Thanks. Please send the payment link/QR link you want me to use, "
+            "Thanks. Please send the payment link/QR link you want me to use (or a upi://pay link), "
             "so I can validate it before proceeding."
         )
-
+    # need_beneficiary_confirm
     return (
         "Got it. For final verification, please confirm the beneficiary name and bank name "
         "exactly as shown on your side."
+    )
+
+
+def ensure_defaults(session_id: str) -> Dict[str, Any]:
+    """Ensure intel defaults exist for a session."""
+    return INTEL.setdefault(
+        session_id,
+        {
+            "urls": [],
+            "upi_links": [],
+            "upi_ids": [],
+            "ifsc": [],
+            "account_numbers": [],
+            "phones": [],
+            "emails": [],
+        },
     )
 
 
@@ -184,10 +215,7 @@ def message(payload: MessageIn):
     session_id = payload.session_id or str(uuid.uuid4())
 
     history = SESSIONS.setdefault(session_id, [])
-    intel = INTEL.setdefault(
-        session_id,
-        {"urls": [], "upi_links": [], "upi_ids": [], "ifsc": [], "account_numbers": [], "phones": [], "emails": []}
-    )
+    intel = ensure_defaults(session_id)
 
     # Risk scoring (Suhas module)
     current_total = int(SCORES.get(session_id, 0))
@@ -196,12 +224,14 @@ def message(payload: MessageIn):
     SCORES[session_id] = new_total
 
     # Decide scam/handoff
-    is_scam = detect_scam(payload.message) or (new_total >= THRESHOLD)
-    handoff = (new_total >= THRESHOLD)
+    keyword_scam = detect_scam(payload.message)
+    handoff = new_total >= THRESHOLD
+    is_scam = keyword_scam or handoff
 
+    # Store incoming
     history.append({"ts": datetime.utcnow().isoformat(), "from": "scammer", "text": payload.message})
 
-    # update intel (merge unique)
+    # Update intel (merge unique)
     new_found = extract_intel(payload.message)
     for k, v in new_found.items():
         existing = set(intel.get(k, []))
@@ -210,14 +240,19 @@ def message(payload: MessageIn):
                 intel.setdefault(k, []).append(item)
                 existing.add(item)
 
-    # reply
-    if handoff or is_scam:
-        reply = agent_reply(history, intel)
+    # Stage machine (only meaningful after scam detected / handoff)
+    if is_scam:
+        stage = compute_stage(intel)
+        STAGES[session_id] = stage
+        reply = agent_reply_for_stage(stage, intel)
     else:
+        STAGES[session_id] = "passive"
         reply = "Hello. Please share the transaction reference so I can verify your payment."
 
+    # Store reply
     history.append({"ts": datetime.utcnow().isoformat(), "from": "bot", "text": reply})
 
+    # Persist
     save_data()
 
     return {
@@ -226,6 +261,7 @@ def message(payload: MessageIn):
         "turns": len(history),
         "scam_detected": is_scam,
         "handoff_to_agent": handoff,
+        "stage": STAGES.get(session_id, "passive"),
         "intel": intel,
         "risk": {
             "score_added": int(score_added),
@@ -242,8 +278,20 @@ def get_session(session_id: str):
     return {
         "session_id": session_id,
         "turns": len(SESSIONS.get(session_id, [])),
+        "stage": STAGES.get(session_id, "unknown"),
         "history": SESSIONS.get(session_id, []),
-        "intel": INTEL.get(session_id, {"urls": [], "upi_links": [], "upi_ids": [], "ifsc": [], "account_numbers": [], "phones": [], "emails": []}),
+        "intel": INTEL.get(
+            session_id,
+            {
+                "urls": [],
+                "upi_links": [],
+                "upi_ids": [],
+                "ifsc": [],
+                "account_numbers": [],
+                "phones": [],
+                "emails": [],
+            },
+        ),
         "risk_total_score": int(SCORES.get(session_id, 0)),
         "risk_threshold": int(THRESHOLD),
     }
@@ -254,5 +302,6 @@ def reset_all():
     SESSIONS.clear()
     INTEL.clear()
     SCORES.clear()
+    STAGES.clear()
     save_data()
     return {"status": "reset-done"}
