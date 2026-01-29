@@ -11,13 +11,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# IMPORTANT: relative import (works reliably when running uvicorn app.main:app)
+# Suhas risk scoring module
 from .scam_detector import analyze_message, THRESHOLD
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY", "")
 
-app = FastAPI(title="Scam Honeypot API", version="0.5")
+app = FastAPI(title="Scam Honeypot API", version="0.6")
 
 # In-memory stores (persisted to disk)
 SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
@@ -86,29 +86,47 @@ def detect_scam(text: str) -> bool:
 
 
 def extract_intel(text: str) -> Dict[str, Any]:
-    """Extract URLs, UPI IDs, IFSC codes, and bank account-like numbers."""
+    """Extract URLs, UPI IDs, IFSC codes, bank account-like numbers, phones, and emails."""
     found: Dict[str, Any] = {}
+    t = text or ""
 
     # URLs (strip trailing punctuation)
-    urls = re.findall(r"https?://[^\s]+", text or "", flags=re.IGNORECASE)
+    urls = re.findall(r"https?://[^\s]+", t, flags=re.IGNORECASE)
     urls = [u.rstrip(".,)]}!?;:") for u in urls]
     if urls:
         found["urls"] = urls
 
-    # Simple UPI regex: name@bank
-    upis = re.findall(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}\b", text or "")
+    # UPI payment deep links (upi://pay?pa=... etc.)
+    upi_links = re.findall(r"\bupi://pay\?[^\s]+", t, flags=re.IGNORECASE)
+    upi_links = [u.rstrip(".,)]}!?;:") for u in upi_links]
+    if upi_links:
+        found["upi_links"] = upi_links
+
+    # UPI IDs (name@bank)
+    upis = re.findall(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}\b", t)
     if upis:
         found["upi_ids"] = upis
 
     # IFSC
-    ifsc = re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", (text or "").upper())
+    ifsc = re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", t.upper())
     if ifsc:
         found["ifsc"] = ifsc
 
     # Account-like numbers: 9 to 18 digits
-    accts = re.findall(r"\b\d{9,18}\b", text or "")
+    accts = re.findall(r"\b\d{9,18}\b", t)
     if accts:
         found["account_numbers"] = accts
+
+    # Phone numbers (India-friendly): +91 optional, 10 digits starting 6-9
+    phones = re.findall(r"\b(?:\+?91[-\s]?)?[6-9]\d{9}\b", t)
+    phones = [p.replace(" ", "").replace("-", "") for p in phones]
+    if phones:
+        found["phones"] = phones
+
+    # Emails
+    emails = re.findall(r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}\b", t)
+    if emails:
+        found["emails"] = emails
 
     return found
 
@@ -121,7 +139,7 @@ def agent_reply(history: List[Dict[str, Any]], intel: Dict[str, Any]) -> str:
     - If got link: ask for beneficiary name and bank details.
     """
     have_upi = bool(intel.get("upi_ids"))
-    have_link = bool(intel.get("urls"))
+    have_link = bool(intel.get("urls") or intel.get("upi_links"))
     have_acct = bool(intel.get("account_numbers"))
     have_ifsc = bool(intel.get("ifsc"))
 
@@ -165,7 +183,7 @@ def message(payload: MessageIn):
     history = SESSIONS.setdefault(session_id, [])
     intel = INTEL.setdefault(
         session_id,
-        {"urls": [], "upi_ids": [], "ifsc": [], "account_numbers": []}
+        {"urls": [], "upi_links": [], "upi_ids": [], "ifsc": [], "account_numbers": [], "phones": [], "emails": []}
     )
 
     # Risk scoring (Suhas module)
@@ -180,7 +198,7 @@ def message(payload: MessageIn):
 
     history.append({"ts": datetime.utcnow().isoformat(), "from": "scammer", "text": payload.message})
 
-    # update intel
+    # update intel (merge unique)
     new_found = extract_intel(payload.message)
     for k, v in new_found.items():
         existing = set(intel.get(k, []))
@@ -222,7 +240,7 @@ def get_session(session_id: str):
         "session_id": session_id,
         "turns": len(SESSIONS.get(session_id, [])),
         "history": SESSIONS.get(session_id, []),
-        "intel": INTEL.get(session_id, {"urls": [], "upi_ids": [], "ifsc": [], "account_numbers": []}),
+        "intel": INTEL.get(session_id, {"urls": [], "upi_links": [], "upi_ids": [], "ifsc": [], "account_numbers": [], "phones": [], "emails": []}),
         "risk_total_score": int(SCORES.get(session_id, 0)),
         "risk_threshold": int(THRESHOLD),
     }
