@@ -146,6 +146,10 @@ def detect_scam_from_risk(risk: Dict[str, Any]) -> bool:
 # ---------------------------
 # Intel extraction
 # ---------------------------
+def _dedupe(items: List[str]) -> List[str]:
+    return list(dict.fromkeys(items))
+
+
 def extract_intel(text: str) -> Dict[str, Any]:
     """
     Extract:
@@ -153,8 +157,8 @@ def extract_intel(text: str) -> Dict[str, Any]:
     - upi_links: upi://pay?... deep links
     - upi_ids: name@bank (tries to avoid emails)
     - ifsc: ABCD0XXXXXX
-    - account_numbers: 9-18 digits
-    - phones: normalized digits
+    - account_numbers: 9-18 digits (excluding 10-digit phones)
+    - phones: normalized digits (keeps last 10 digits if prefixed like +91)
     - emails: valid emails
     """
     found: Dict[str, Any] = {}
@@ -163,48 +167,60 @@ def extract_intel(text: str) -> Dict[str, Any]:
     # URLs
     urls = re.findall(r"https?://[^\s]+", t, flags=re.IGNORECASE)
     urls = [u.rstrip(".,)]}!?;:") for u in urls]
+    urls = _dedupe(urls)
     if urls:
         found["urls"] = urls
 
     # UPI deep links
     upi_links = re.findall(r"\bupi://pay\?[^\s]+", t, flags=re.IGNORECASE)
     upi_links = [u.rstrip(".,)]}!?;:") for u in upi_links]
+    upi_links = _dedupe(upi_links)
     if upi_links:
         found["upi_links"] = upi_links
 
     # Emails
     emails = re.findall(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", t)
+    emails = _dedupe(emails)
     if emails:
         found["emails"] = emails
 
     # UPI IDs (avoid emails by disallowing '.' in bank part)
     candidates = re.findall(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_]{2,}\b", t)
-    upis = []
+    upis: List[str] = []
     for c in candidates:
         bank_part = c.split("@", 1)[1]
         if "." not in bank_part:  # emails have domain dots
             upis.append(c)
+    upis = _dedupe(upis)
     if upis:
         found["upi_ids"] = upis
 
     # IFSC
     ifsc = re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", t.upper())
+    ifsc = _dedupe(ifsc)
     if ifsc:
         found["ifsc"] = ifsc
 
-    # Account-like numbers
-    accts = re.findall(r"\b\d{9,18}\b", t)
+    # Account-like numbers (exclude 10-digit phones)
+    candidates = re.findall(r"\b\d{9,18}\b", t)
+    accts = [c for c in candidates if len(c) != 10]
+    accts = _dedupe(accts)
     if accts:
         found["account_numbers"] = accts
 
-    # Phones (+91 optional, keep digits only)
-    phone_candidates = re.findall(r"(?:\+?\d{1,3}[\s\-]?)?\b\d{10}\b", t)
-    phones = []
-    for p in phone_candidates:
+    # Phones:
+    # - match +91 / 0 / spaces / hyphens, but always capture full match
+    # - normalize to last 10 digits (so +91 9876... becomes 9876...)
+    phone_matches = []
+    for m in re.finditer(r"(?:\+?\d{1,3}[\s\-]?)?\b\d{10}\b", t):
+        phone_matches.append(m.group(0))
+
+    phones: List[str] = []
+    for p in phone_matches:
         digits = re.sub(r"\D", "", p)
         if len(digits) >= 10:
-            phones.append(digits)
-    phones = list(dict.fromkeys(phones))
+            phones.append(digits[-10:])  # keep last 10 digits
+    phones = _dedupe(phones)
     if phones:
         found["phones"] = phones
 
