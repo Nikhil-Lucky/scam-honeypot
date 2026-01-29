@@ -103,9 +103,12 @@ def extract_intel(text: str) -> Dict[str, Any]:
         found["upi_links"] = upi_links
 
     # UPI IDs (name@bank)
-    upis = re.findall(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}\b", t)
+    candidates = re.findall(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9.\-_]{2,}\b", t)
+    # Keep only UPI-like handles (bank part should NOT contain a dot like .com)
+    upis = [c for c in candidates if "." not in c.split("@", 1)[1]]
     if upis:
         found["upi_ids"] = upis
+
 
     # IFSC
     ifsc = re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", t.upper())
