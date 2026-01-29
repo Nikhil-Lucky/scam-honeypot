@@ -2,9 +2,10 @@ import os
 import re
 import uuid
 import json
+import time
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -21,6 +22,38 @@ SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
 INTEL: Dict[str, Dict[str, Any]] = {}   # session_id -> extracted intel
 RISK_STATE: Dict[str, int] = {}         # session_id -> rolling risk score
 DATA_FILE = Path("data.json")
+
+# ---------------------------
+# Step 3: Simple abuse protection
+# ---------------------------
+MAX_BODY_BYTES = 64 * 1024  # 64KB
+
+# Token-bucket rate limiter (per IP, in-memory)
+RATE_LIMIT_RPS = 2.0        # refill 2 tokens/sec
+RATE_LIMIT_BURST = 10.0     # allow short bursts up to 10
+_RL: Dict[str, Tuple[float, float]] = {}  # ip -> (tokens, last_ts)
+
+
+def _rate_limit_allow(ip: str) -> bool:
+    now = time.monotonic()
+    tokens, last = _RL.get(ip, (RATE_LIMIT_BURST, now))
+    # refill
+    tokens = min(RATE_LIMIT_BURST, tokens + (now - last) * RATE_LIMIT_RPS)
+    if tokens < 1.0:
+        _RL[ip] = (tokens, now)
+        return False
+    _RL[ip] = (tokens - 1.0, now)
+    return True
+
+
+def _get_client_ip(request: Request) -> str:
+    # tries reverse-proxy header first
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
 
 
 # ---------------------------
@@ -51,7 +84,7 @@ load_data()
 # ---------------------------
 # Security middleware
 # ---------------------------
-OPEN_PATHS = {"/health", "/"}  # safe public pings
+OPEN_PATHS = {"/health", "/", "/docs-info"}  # safe public pings + judge helper
 OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 
 
@@ -59,13 +92,25 @@ OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 async def api_key_middleware(request: Request, call_next):
     path = request.url.path
 
+    # 0) payload size guard (based on Content-Length when present)
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"error": "Payload too large"})
+
     # allow safe public paths without key
     if path in OPEN_PATHS or path.startswith(OPEN_PREFIXES):
         return await call_next(request)
 
+    # 1) API key check (your existing logic)
     provided = request.headers.get("x-api-key", "")
     if not API_KEY or provided != API_KEY:
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+
+    # 2) rate limit (after auth, only for protected endpoints)
+    ip = _get_client_ip(request)
+    if not _rate_limit_allow(ip):
+        return JSONResponse(status_code=429, content={"error": "Too many requests"})
+
     return await call_next(request)
 
 
@@ -275,6 +320,15 @@ def agent_reply(stage: str, intel: Dict[str, Any]) -> str:
 
 
 # ---------------------------
+# Helper: base url for /docs-info
+# ---------------------------
+def _detect_base_url(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}"
+
+
+# ---------------------------
 # Routes
 # ---------------------------
 @app.get("/")
@@ -285,7 +339,59 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"ok": True, "status": "up"}
+
+
+@app.get("/docs-info")
+def docs_info(request: Request):
+    base_url = _detect_base_url(request)
+
+    main_path = "/message"
+    alt_path = "/"  # some evaluators post to base URL
+
+    example_request = {
+        "session_id": "optional-session-id",
+        "message": "KYC expired. Pay to upi://pay?pa=test@upi. https://bit.ly/pay-now."
+    }
+
+    curl_body = json.dumps(example_request, ensure_ascii=False)
+
+    return {
+        "service": "Scam Honeypot API",
+        "base_url": base_url,
+        "auth": {
+            "required": True,
+            "header_name": "x-api-key",
+            "example": "x-api-key: <your-api-key>"
+        },
+        "endpoints": [
+            {"method": "GET", "path": "/health", "purpose": "Health check"},
+            {"method": "GET", "path": "/docs-info", "purpose": "How to call this API"},
+            {"method": "POST", "path": main_path, "purpose": "Main message endpoint", "expects": example_request},
+            {"method": "POST", "path": alt_path, "purpose": "Alternate (base URL) message endpoint", "expects": example_request},
+            {"method": "GET", "path": "/session/{session_id}", "purpose": "Fetch session history + intel"},
+            {"method": "POST", "path": "/reset", "purpose": "Reset all sessions (requires API key)"},
+        ],
+        "sample_curl": (
+            f'curl -X POST "{base_url}{main_path}" '
+            f'-H "Content-Type: application/json" '
+            f'-H "x-api-key: <your-api-key>" '
+            f"-d '{curl_body}'"
+        ),
+        "sample_powershell": (
+            '$headers = @{ "x-api-key" = "<your-api-key>"; "Content-Type"="application/json" }\n'
+            f"$body = '{curl_body}'\n"
+            f'Invoke-RestMethod -Method POST -Uri "{base_url}{main_path}" -Headers $headers -Body $body'
+        ),
+        "notes": [
+            "Send scammer messages to POST /message (or POST / if evaluator uses base URL).",
+            "If session_id is omitted, the server generates one.",
+            "Intel extraction includes urls, upi_links, upi_ids, ifsc, account_numbers, phones, emails.",
+            f"Payload limit: {MAX_BODY_BYTES} bytes (Content-Length based).",
+            f"Rate limit: ~{RATE_LIMIT_RPS}/sec with burst {RATE_LIMIT_BURST} per IP on protected routes."
+        ],
+        "example_request_body": example_request
+    }
 
 
 @app.post("/message")
