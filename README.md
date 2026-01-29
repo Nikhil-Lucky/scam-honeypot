@@ -43,6 +43,9 @@ All protected endpoints require header (public endpoints: `/health`, `/docs-info
 - POST `/` (alternate message endpoint; requires header `x-api-key`)
 - GET `/session/{session_id}` (requires header `x-api-key`)
 - POST `/reset` (requires header `x-api-key`)
+- GET /intel/{session_id} (requires header x-api-key)
+- GET /intel?limit=20 (requires header x-api-key)
+- GET /stats (requires header x-api-key)
 
 
 ## Test (PowerShell)
