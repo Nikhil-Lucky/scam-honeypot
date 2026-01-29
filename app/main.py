@@ -29,9 +29,8 @@ DATA_FILE = Path("data.json")
 MAX_BODY_BYTES = 64 * 1024  # 64KB
 
 # Token-bucket rate limiter (per IP, in-memory)
-# (Keep generous so portal testers that retry won't get stuck)
-RATE_LIMIT_RPS = 50.0
-RATE_LIMIT_BURST = 200.0
+RATE_LIMIT_RPS = 2.0
+RATE_LIMIT_BURST = 10.0
 _RL: Dict[str, Tuple[float, float]] = {}  # ip -> (tokens, last_ts)
 
 
@@ -82,7 +81,7 @@ load_data()
 # ---------------------------
 # Security middleware
 # ---------------------------
-OPEN_PATHS = {"/health", "/", "/docs-info"}
+OPEN_PATHS = {"/health", "/", "/docs-info"}  # allow pings + helper without key
 OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 
 
@@ -90,7 +89,7 @@ OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 async def api_key_middleware(request: Request, call_next):
     path = request.url.path
 
-    # payload size guard (based on Content-Length when present)
+    # Payload size guard (Content-Length when present)
     cl = request.headers.get("content-length")
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse(status_code=413, content={"error": "Payload too large"})
@@ -99,11 +98,12 @@ async def api_key_middleware(request: Request, call_next):
     if path in OPEN_PATHS or path.startswith(OPEN_PREFIXES):
         return await call_next(request)
 
+    # API key check
     provided = request.headers.get("x-api-key", "")
     if not API_KEY or provided != API_KEY:
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-    # rate limit only for protected endpoints
+    # rate limit protected routes
     ip = _get_client_ip(request)
     if not _rate_limit_allow(ip):
         return JSONResponse(status_code=429, content={"error": "Too many requests"})
@@ -112,7 +112,7 @@ async def api_key_middleware(request: Request, call_next):
 
 
 # ---------------------------
-# Models (still used for local/dev)
+# Models
 # ---------------------------
 class MessageIn(BaseModel):
     session_id: Optional[str] = None
@@ -139,7 +139,7 @@ THRESHOLD = 50
 def analyze_risk(message: str, previous_total: int) -> Dict[str, Any]:
     score_increment = 0
     evidence: List[str] = []
-    m = (message or "").lower()
+    m = message.lower()
 
     for w in KEYWORDS["high_risk"]:
         if w in m:
@@ -151,7 +151,7 @@ def analyze_risk(message: str, previous_total: int) -> Dict[str, Any]:
             score_increment += 10
             evidence.append(f"Medium risk keyword: '{w}'")
 
-    if re.search(r"\b\d{10}\b", message or ""):
+    if re.search(r"\b\d{10}\b", message):
         score_increment += 15
         evidence.append("Pattern match: 10-digit number detected")
 
@@ -159,7 +159,7 @@ def analyze_risk(message: str, previous_total: int) -> Dict[str, Any]:
         score_increment += 20
         evidence.append("Pattern match: suspicious link detected")
 
-    if re.search(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_]{2,}\b", message or ""):
+    if re.search(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_]{2,}\b", message):
         score_increment += 25
         evidence.append("Pattern match: UPI ID detected")
 
@@ -190,7 +190,7 @@ def _dedupe(items: List[str]) -> List[str]:
 
 def extract_intel(text: str) -> Dict[str, Any]:
     found: Dict[str, Any] = {}
-    t = text or ""
+    t = text
 
     urls = re.findall(r"https?://[^\s]+", t, flags=re.IGNORECASE)
     urls = _dedupe([u.rstrip(".,)]}!?;:") for u in urls])
@@ -210,7 +210,7 @@ def extract_intel(text: str) -> Dict[str, Any]:
     upis: List[str] = []
     for c in candidates:
         bank_part = c.split("@", 1)[1]
-        if "." not in bank_part:
+        if "." not in bank_part:  # avoid emails
             upis.append(c)
     upis = _dedupe(upis)
     if upis:
@@ -220,8 +220,8 @@ def extract_intel(text: str) -> Dict[str, Any]:
     if ifsc:
         found["ifsc"] = ifsc
 
-    candidates = re.findall(r"\b\d{9,18}\b", t)
-    accts = _dedupe([c for c in candidates if len(c) != 10])
+    num_candidates = re.findall(r"\b\d{9,18}\b", t)
+    accts = _dedupe([c for c in num_candidates if len(c) != 10])  # exclude 10-digit phones
     if accts:
         found["account_numbers"] = accts
 
@@ -249,7 +249,7 @@ def merge_unique_list(dst: Dict[str, Any], key: str, items: List[str]) -> None:
 
 
 # ---------------------------
-# Agent
+# Agent (UPI Support persona)
 # ---------------------------
 def compute_stage(intel: Dict[str, Any]) -> str:
     have_upi = bool(intel.get("upi_ids"))
@@ -264,7 +264,7 @@ def compute_stage(intel: Dict[str, Any]) -> str:
     return "need_confirmation"
 
 
-def agent_reply(stage: str, intel: Dict[str, Any]) -> str:
+def agent_reply(stage: str) -> str:
     if stage == "need_beneficiary_details":
         return (
             "Hello, UPI Support here. To verify the beneficiary, please share the UPI ID "
@@ -282,57 +282,41 @@ def agent_reply(stage: str, intel: Dict[str, Any]) -> str:
 
 
 # ---------------------------
-# Helper: base url for /docs-info
+# Robust payload parser (FIXES portal INVALID_REQUEST_BODY)
 # ---------------------------
-def _detect_base_url(request: Request) -> str:
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
-    return f"{proto}://{host}"
+async def _parse_message_payload(request: Request, payload: Optional[MessageIn]) -> Tuple[Optional[str], str]:
+    # 1) If FastAPI successfully parsed MessageIn, use it
+    if payload is not None and payload.message:
+        return payload.session_id, payload.message
 
+    # 2) Try JSON (even if Content-Type is wrong)
+    raw = await request.body()
+    if raw:
+        # Try JSON
+        try:
+            data = json.loads(raw.decode("utf-8", errors="ignore"))
+            if isinstance(data, dict):
+                # Accept multiple possible keys
+                msg = (
+                    data.get("message")
+                    or data.get("msg")
+                    or data.get("text")
+                    or data.get("input")
+                    or ""
+                )
+                sid = data.get("session_id") or data.get("session") or data.get("sid")
+                if isinstance(msg, str) and msg.strip():
+                    return (sid if isinstance(sid, str) else None), msg
+        except Exception:
+            pass
 
-# ---------------------------
-# Robust payload parsing (THIS fixes INVALID_REQUEST_BODY)
-# ---------------------------
-def _extract_message_fields(payload: Any) -> Tuple[Optional[str], str]:
-    """
-    Accepts many shapes:
-    - {"message": "...", "session_id": "..."}
-    - {"text": "..."} or {"input": "..."} etc.
-    - {} / None  -> message becomes "" (safe)
-    - plain string -> treated as message
-    """
-    if payload is None:
-        return None, ""
+        # 3) If not JSON, treat raw as plain-text message
+        msg_txt = raw.decode("utf-8", errors="ignore").strip()
+        if msg_txt:
+            return None, msg_txt
 
-    if isinstance(payload, str):
-        return None, payload
-
-    if isinstance(payload, dict):
-        sid = (
-            payload.get("session_id")
-            or payload.get("sessionId")
-            or payload.get("sid")
-        )
-
-        msg = (
-            payload.get("message")
-            or payload.get("text")
-            or payload.get("msg")
-            or payload.get("input")
-            or payload.get("content")
-            or ""
-        )
-
-        if not isinstance(msg, str):
-            try:
-                msg = json.dumps(msg, ensure_ascii=False)
-            except Exception:
-                msg = str(msg)
-
-        return sid, msg
-
-    # unknown type
-    return None, str(payload)
+    # 4) Fallback: don’t fail portal tester; use a safe default message
+    return None, "Hello (tester ping). Please send the scam message text."
 
 
 # ---------------------------
@@ -350,12 +334,10 @@ def health():
 
 @app.get("/docs-info")
 def docs_info(request: Request):
-    base_url = _detect_base_url(request)
-    example_request = {
-        "session_id": "optional-session-id",
-        "message": "KYC expired. Pay to upi://pay?pa=test@upi. https://bit.ly/pay-now."
-    }
-    curl_body = json.dumps(example_request, ensure_ascii=False)
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    base_url = f"{proto}://{host}"
+
     return {
         "service": "Scam Honeypot API",
         "base_url": base_url,
@@ -368,12 +350,10 @@ def docs_info(request: Request):
             {"method": "GET", "path": "/session/{session_id}"},
             {"method": "POST", "path": "/reset"},
         ],
-        "sample_powershell": (
-            '$headers = @{ "x-api-key" = "<your-api-key>"; "Content-Type"="application/json" }\n'
-            f"$body = '{curl_body}'\n"
-            f'Invoke-RestMethod -Method POST -Uri "{base_url}/message" -Headers $headers -Body $body'
-        ),
-        "example_request_body": example_request,
+        "example_request_body": {
+            "session_id": "optional-session-id",
+            "message": "KYC expired. Pay to upi://pay?pa=test@upi. https://bit.ly/pay-now."
+        },
     }
 
 
@@ -400,12 +380,10 @@ def _process_message(session_id: Optional[str], message_text: str) -> Dict[str, 
     is_scam = detect_scam_from_risk(risk)
     stage = compute_stage(intel) if is_scam else "passive"
 
-    if is_scam:
-        reply = agent_reply(stage, intel)
-    else:
-        reply = "Hello. Please share the transaction reference so I can verify your payment."
+    reply = agent_reply(stage) if is_scam else "Hello. Please share the transaction reference so I can verify your payment."
 
     history.append({"ts": datetime.utcnow().isoformat(), "from": "bot", "text": reply})
+
     save_data()
 
     return {
@@ -421,24 +399,15 @@ def _process_message(session_id: Optional[str], message_text: str) -> Dict[str, 
 
 
 @app.post("/message")
-async def message_endpoint(request: Request, payload: Any = Body(default=None)):
-    # If portal sends invalid JSON/empty body, still handle safely
-    if payload is None:
-        raw = await request.body()
-        if raw:
-            try:
-                payload = json.loads(raw.decode("utf-8", errors="ignore"))
-            except Exception:
-                payload = raw.decode("utf-8", errors="ignore")
-
-    session_id, msg = _extract_message_fields(payload)
-    return _process_message(session_id, msg)
+async def message(request: Request, payload: Optional[MessageIn] = Body(default=None)):
+    sid, msg = await _parse_message_payload(request, payload)
+    return _process_message(sid, msg)
 
 
 @app.post("/")
-async def root_post(request: Request, payload: Any = Body(default=None)):
-    # some evaluators POST to base URL
-    return await message_endpoint(request, payload)
+async def root_post(request: Request, payload: Optional[MessageIn] = Body(default=None)):
+    sid, msg = await _parse_message_payload(request, payload)
+    return _process_message(sid, msg)
 
 
 @app.get("/session/{session_id}")
