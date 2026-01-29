@@ -4,22 +4,25 @@ import uuid
 import json
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Body, Query
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY", "")
 
-app = FastAPI(title="Scam Honeypot API", version="0.6")
+app = FastAPI(title="Scam Honeypot API", version="1.0")
 
-# In-memory stores (persisted to disk)
+# ---------------------------
+# In-memory stores (persisted)
+# ---------------------------
 SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
-INTEL: Dict[str, Dict[str, Any]] = {}   # session_id -> extracted intel
-RISK_STATE: Dict[str, int] = {}         # session_id -> rolling risk score
+INTEL: Dict[str, Dict[str, Any]] = {}
+RISK_STATE: Dict[str, int] = {}
 DATA_FILE = Path("data.json")
 
 # ---------------------------
@@ -27,7 +30,6 @@ DATA_FILE = Path("data.json")
 # ---------------------------
 MAX_BODY_BYTES = 64 * 1024  # 64KB
 
-# Token-bucket rate limiter (per IP, in-memory)
 RATE_LIMIT_RPS = 2.0
 RATE_LIMIT_BURST = 10.0
 _RL: Dict[str, Tuple[float, float]] = {}  # ip -> (tokens, last_ts)
@@ -80,7 +82,7 @@ load_data()
 # ---------------------------
 # Security middleware
 # ---------------------------
-OPEN_PATHS = {"/health", "/", "/docs-info"}  # public helper endpoints
+OPEN_PATHS = {"/health", "/", "/docs-info"}
 OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 
 
@@ -88,12 +90,12 @@ OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 async def api_key_middleware(request: Request, call_next):
     path = request.url.path
 
-    # Payload size guard (Content-Length when present)
+    # Payload size guard
     cl = request.headers.get("content-length")
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse(status_code=413, content={"error": "Payload too large"})
 
-    # allow safe public paths without key
+    # Public endpoints
     if path in OPEN_PATHS or path.startswith(OPEN_PREFIXES):
         return await call_next(request)
 
@@ -102,12 +104,20 @@ async def api_key_middleware(request: Request, call_next):
     if not API_KEY or provided != API_KEY:
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-    # rate limit protected routes
+    # Rate limit (protected endpoints)
     ip = _get_client_ip(request)
     if not _rate_limit_allow(ip):
         return JSONResponse(status_code=429, content={"error": "Too many requests"})
 
     return await call_next(request)
+
+
+# ---------------------------
+# Models
+# ---------------------------
+class MessageIn(BaseModel):
+    session_id: Optional[str] = None
+    message: str
 
 
 # ---------------------------
@@ -127,6 +137,14 @@ KEYWORDS = {
 THRESHOLD = 50
 
 
+def risk_level(total_score: int) -> str:
+    if total_score >= 80:
+        return "high"
+    if total_score >= THRESHOLD:
+        return "medium"
+    return "low"
+
+
 def analyze_risk(message: str, previous_total: int) -> Dict[str, Any]:
     score_increment = 0
     evidence: List[str] = []
@@ -142,26 +160,28 @@ def analyze_risk(message: str, previous_total: int) -> Dict[str, Any]:
             score_increment += 10
             evidence.append(f"Medium risk keyword: '{w}'")
 
+    # 10-digit number (phone-ish)
     if re.search(r"\b\d{10}\b", message):
         score_increment += 15
         evidence.append("Pattern match: 10-digit number detected")
 
-    if re.search(r"(https?://|bit\.ly|tinyurl\.com|t\.me|rb\.gy)", m):
+    # suspicious links
+    if re.search(r"(https?://|bit\.ly|tinyurl\.com|t\.me|rb\.gy|wa\.me)", m):
         score_increment += 20
         evidence.append("Pattern match: suspicious link detected")
 
+    # UPI-like handle
     if re.search(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_]{2,}\b", message):
         score_increment += 25
         evidence.append("Pattern match: UPI ID detected")
 
     new_total = previous_total + score_increment
-    state = "passive"
-    if new_total >= THRESHOLD:
-        state = "agent_handoff"
+    state = "agent_handoff" if new_total >= THRESHOLD else "passive"
 
     return {
         "score_added": score_increment,
         "total_score": new_total,
+        "risk_level": risk_level(new_total),
         "evidence": evidence,
         "state": state,
         "threshold": THRESHOLD,
@@ -187,26 +207,42 @@ def extract_intel(text: str) -> Dict[str, Any]:
     - upi_ids: name@bank (tries to avoid emails)
     - ifsc: ABCD0XXXXXX
     - account_numbers: 9-18 digits (excluding 10-digit phones)
-    - phones: normalized digits (keep last 10 digits)
+    - phones: last-10 digits normalized
     - emails: valid emails
+    - qr_links: likely QR/image links (.png/.jpg etc.)
+    - messaging_links: t.me / wa.me links etc.
+    - handles: @username handles
     """
     found: Dict[str, Any] = {}
     t = text
 
     # URLs
     urls = re.findall(r"https?://[^\s]+", t, flags=re.IGNORECASE)
-    urls = _dedupe([u.rstrip(".,)]}!?;:") for u in urls])
+    urls = [u.rstrip(".,)]}!?;:") for u in urls]
+    urls = _dedupe(urls)
     if urls:
         found["urls"] = urls
 
+    # Messaging links (subset of urls)
+    messaging_links = [u for u in urls if re.search(r"(t\.me/|wa\.me/|chat\.whatsapp\.com/)", u, flags=re.IGNORECASE)]
+    if messaging_links:
+        found["messaging_links"] = _dedupe(messaging_links)
+
+    # QR / image links (subset of urls)
+    qr_links = [u for u in urls if re.search(r"\.(png|jpg|jpeg|webp|gif)(\?|$)", u, flags=re.IGNORECASE) or "qr" in u.lower()]
+    if qr_links:
+        found["qr_links"] = _dedupe(qr_links)
+
     # UPI deep links
     upi_links = re.findall(r"\bupi://pay\?[^\s]+", t, flags=re.IGNORECASE)
-    upi_links = _dedupe([u.rstrip(".,)]}!?;:") for u in upi_links])
+    upi_links = [u.rstrip(".,)]}!?;:") for u in upi_links]
+    upi_links = _dedupe(upi_links)
     if upi_links:
         found["upi_links"] = upi_links
 
     # Emails
-    emails = _dedupe(re.findall(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", t))
+    emails = re.findall(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", t)
+    emails = _dedupe(emails)
     if emails:
         found["emails"] = emails
 
@@ -222,17 +258,19 @@ def extract_intel(text: str) -> Dict[str, Any]:
         found["upi_ids"] = upis
 
     # IFSC
-    ifsc = _dedupe(re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", t.upper()))
+    ifsc = re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", t.upper())
+    ifsc = _dedupe(ifsc)
     if ifsc:
         found["ifsc"] = ifsc
 
-    # Account numbers (exclude 10-digit phones)
+    # Account numbers (exclude 10-digit)
     num_candidates = re.findall(r"\b\d{9,18}\b", t)
-    accts = _dedupe([c for c in num_candidates if len(c) != 10])
+    accts = [c for c in num_candidates if len(c) != 10]
+    accts = _dedupe(accts)
     if accts:
         found["account_numbers"] = accts
 
-    # Phones (keep last 10 digits)
+    # Phones -> last 10 digits
     phone_matches = [m.group(0) for m in re.finditer(r"(?:\+?\d{1,3}[\s\-]?)?\b\d{10}\b", t)]
     phones: List[str] = []
     for p in phone_matches:
@@ -242,6 +280,12 @@ def extract_intel(text: str) -> Dict[str, Any]:
     phones = _dedupe(phones)
     if phones:
         found["phones"] = phones
+
+    # @handles
+    handles = re.findall(r"(?<!\w)@([a-zA-Z0-9_]{3,32})\b", t)
+    handles = _dedupe([f"@{h}" for h in handles])
+    if handles:
+        found["handles"] = handles
 
     return found
 
@@ -256,12 +300,27 @@ def merge_unique_list(dst: Dict[str, Any], key: str, items: List[str]) -> None:
             existing.add(it)
 
 
+def default_intel() -> Dict[str, Any]:
+    return {
+        "urls": [],
+        "upi_links": [],
+        "upi_ids": [],
+        "ifsc": [],
+        "account_numbers": [],
+        "phones": [],
+        "emails": [],
+        "qr_links": [],
+        "messaging_links": [],
+        "handles": [],
+    }
+
+
 # ---------------------------
 # Agent (UPI Support persona)
 # ---------------------------
 def compute_stage(intel: Dict[str, Any]) -> str:
     have_upi = bool(intel.get("upi_ids"))
-    have_link = bool(intel.get("urls")) or bool(intel.get("upi_links"))
+    have_link = bool(intel.get("urls")) or bool(intel.get("upi_links")) or bool(intel.get("qr_links"))
     have_acct = bool(intel.get("account_numbers"))
     have_ifsc = bool(intel.get("ifsc"))
 
@@ -290,48 +349,15 @@ def agent_reply(stage: str) -> str:
 
 
 # ---------------------------
-# Robust payload parser (prevents 422 / portal INVALID_REQUEST_BODY)
+# Robust payload parser (portal-safe)
 # ---------------------------
-async def _parse_message_payload(request: Request) -> Tuple[Optional[str], str]:
-    # 0) Query param fallback (some testers do this)
-    qp_msg = request.query_params.get("message") or request.query_params.get("msg") or request.query_params.get("text")
-    qp_sid = request.query_params.get("session_id") or request.query_params.get("sid") or request.query_params.get("session")
-    if qp_msg:
-        return (qp_sid if qp_sid else None), qp_msg
+async def _parse_message_payload(request: Request, payload: Optional[MessageIn]) -> Tuple[Optional[str], str]:
+    if payload is not None and isinstance(payload.message, str) and payload.message.strip():
+        return payload.session_id, payload.message
 
-    # 1) Try request.json() (even if content-type is wrong, it might work)
-    try:
-        data = await request.json()
-        if isinstance(data, dict):
-            msg = (
-                data.get("message")
-                or data.get("msg")
-                or data.get("text")
-                or data.get("input")
-                or data.get("prompt")
-                or ""
-            )
-            sid = data.get("session_id") or data.get("session") or data.get("sid")
-            if isinstance(msg, str) and msg.strip():
-                return (sid if isinstance(sid, str) else None), msg.strip()
-    except Exception:
-        pass
-
-    # 2) Try form-encoded (some portals submit like this)
-    try:
-        form = await request.form()
-        if form:
-            msg = form.get("message") or form.get("msg") or form.get("text") or form.get("input") or ""
-            sid = form.get("session_id") or form.get("sid") or None
-            if isinstance(msg, str) and msg.strip():
-                return (sid if isinstance(sid, str) else None), msg.strip()
-    except Exception:
-        pass
-
-    # 3) Try raw bytes as JSON or plain text
     raw = await request.body()
     if raw:
-        # JSON parse
+        # Try JSON even if content-type is wrong
         try:
             data = json.loads(raw.decode("utf-8", errors="ignore"))
             if isinstance(data, dict):
@@ -340,34 +366,34 @@ async def _parse_message_payload(request: Request) -> Tuple[Optional[str], str]:
                     or data.get("msg")
                     or data.get("text")
                     or data.get("input")
-                    or data.get("prompt")
                     or ""
                 )
                 sid = data.get("session_id") or data.get("session") or data.get("sid")
                 if isinstance(msg, str) and msg.strip():
-                    return (sid if isinstance(sid, str) else None), msg.strip()
+                    return (sid if isinstance(sid, str) else None), msg
         except Exception:
             pass
 
-        # plain text
-        txt = raw.decode("utf-8", errors="ignore").strip()
-        if txt:
-            return None, txt
+        # If not JSON, treat as plain text
+        msg_txt = raw.decode("utf-8", errors="ignore").strip()
+        if msg_txt:
+            return None, msg_txt
 
-    # 4) Final fallback (never 422)
+    # fallback (so tester doesn’t fail)
     return None, "Hello (tester ping). Please send the scam message text."
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _process_message(session_id: Optional[str], message_text: str) -> Dict[str, Any]:
     sid = session_id or str(uuid.uuid4())
 
     history = SESSIONS.setdefault(sid, [])
-    intel = INTEL.setdefault(
-        sid,
-        {"urls": [], "upi_links": [], "upi_ids": [], "ifsc": [], "account_numbers": [], "phones": [], "emails": []},
-    )
+    intel = INTEL.setdefault(sid, default_intel())
 
-    history.append({"ts": datetime.utcnow().isoformat(), "from": "scammer", "text": message_text})
+    history.append({"ts": _now_iso(), "from": "scammer", "text": message_text})
 
     new_found = extract_intel(message_text)
     for k, v in new_found.items():
@@ -382,7 +408,8 @@ def _process_message(session_id: Optional[str], message_text: str) -> Dict[str, 
     stage = compute_stage(intel) if is_scam else "passive"
 
     reply = agent_reply(stage) if is_scam else "Hello. Please share the transaction reference so I can verify your payment."
-    history.append({"ts": datetime.utcnow().isoformat(), "from": "bot", "text": reply})
+
+    history.append({"ts": _now_iso(), "from": "bot", "text": reply})
 
     save_data()
 
@@ -427,24 +454,27 @@ def docs_info(request: Request):
             {"method": "POST", "path": "/message"},
             {"method": "POST", "path": "/"},
             {"method": "GET", "path": "/session/{session_id}"},
+            {"method": "GET", "path": "/intel/{session_id}"},
+            {"method": "GET", "path": "/intel?limit=20"},
+            {"method": "GET", "path": "/stats"},
             {"method": "POST", "path": "/reset"},
         ],
         "example_request_body": {
             "session_id": "optional-session-id",
-            "message": "KYC expired. Pay to upi://pay?pa=test@upi. https://bit.ly/pay-now."
+            "message": "KYC expired. Pay upi://pay?pa=test@upi. https://bit.ly/pay-now."
         },
     }
 
 
 @app.post("/message")
-async def message(request: Request):
-    sid, msg = await _parse_message_payload(request)
+async def message(request: Request, payload: Optional[MessageIn] = Body(default=None)):
+    sid, msg = await _parse_message_payload(request, payload)
     return _process_message(sid, msg)
 
 
 @app.post("/")
-async def root_post(request: Request):
-    sid, msg = await _parse_message_payload(request)
+async def root_post(request: Request, payload: Optional[MessageIn] = Body(default=None)):
+    sid, msg = await _parse_message_payload(request, payload)
     return _process_message(sid, msg)
 
 
@@ -454,11 +484,51 @@ def get_session(session_id: str):
         "session_id": session_id,
         "turns": len(SESSIONS.get(session_id, [])),
         "history": SESSIONS.get(session_id, []),
-        "intel": INTEL.get(
-            session_id,
-            {"urls": [], "upi_links": [], "upi_ids": [], "ifsc": [], "account_numbers": [], "phones": [], "emails": []},
-        ),
+        "intel": INTEL.get(session_id, default_intel()),
         "risk_total": int(RISK_STATE.get(session_id, 0)),
+        "risk_level": risk_level(int(RISK_STATE.get(session_id, 0))),
+    }
+
+
+# ✅ NEW: intel-only view for judges
+@app.get("/intel/{session_id}")
+def get_intel(session_id: str):
+    return {
+        "session_id": session_id,
+        "intel": INTEL.get(session_id, default_intel()),
+        "risk_total": int(RISK_STATE.get(session_id, 0)),
+        "risk_level": risk_level(int(RISK_STATE.get(session_id, 0))),
+    }
+
+
+# ✅ NEW: list recent sessions + intel (quick demo)
+@app.get("/intel")
+def list_recent_intel(limit: int = Query(default=20, ge=1, le=100)):
+    # “recent” = last N session_ids by insertion order (good enough for hackathon)
+    session_ids = list(SESSIONS.keys())[-limit:]
+    out = []
+    for sid in reversed(session_ids):
+        out.append({
+            "session_id": sid,
+            "turns": len(SESSIONS.get(sid, [])),
+            "risk_total": int(RISK_STATE.get(sid, 0)),
+            "risk_level": risk_level(int(RISK_STATE.get(sid, 0))),
+            "intel": INTEL.get(sid, default_intel()),
+        })
+    return {"count": len(out), "items": out}
+
+
+# ✅ NEW: stats endpoint
+@app.get("/stats")
+def stats():
+    total_sessions = len(SESSIONS)
+    total_turns = sum(len(v) for v in SESSIONS.values())
+    scam_sessions = sum(1 for sid, score in RISK_STATE.items() if int(score) >= THRESHOLD)
+    return {
+        "sessions_total": total_sessions,
+        "turns_total": total_turns,
+        "scam_sessions": scam_sessions,
+        "threshold": THRESHOLD,
     }
 
 
