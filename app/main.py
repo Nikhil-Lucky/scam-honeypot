@@ -8,14 +8,14 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY", "")
 
-app = FastAPI(title="Scam Honeypot API", version="0.5")
+app = FastAPI(title="Scam Honeypot API", version="0.6")
 
 # In-memory stores (persisted to disk)
 SESSIONS: Dict[str, List[Dict[str, Any]]] = {}
@@ -24,20 +24,20 @@ RISK_STATE: Dict[str, int] = {}         # session_id -> rolling risk score
 DATA_FILE = Path("data.json")
 
 # ---------------------------
-# Step 3: Simple abuse protection
+# Simple abuse protection
 # ---------------------------
 MAX_BODY_BYTES = 64 * 1024  # 64KB
 
 # Token-bucket rate limiter (per IP, in-memory)
-RATE_LIMIT_RPS = 2.0        # refill 2 tokens/sec
-RATE_LIMIT_BURST = 10.0     # allow short bursts up to 10
+# (Keep generous so portal testers that retry won't get stuck)
+RATE_LIMIT_RPS = 50.0
+RATE_LIMIT_BURST = 200.0
 _RL: Dict[str, Tuple[float, float]] = {}  # ip -> (tokens, last_ts)
 
 
 def _rate_limit_allow(ip: str) -> bool:
     now = time.monotonic()
     tokens, last = _RL.get(ip, (RATE_LIMIT_BURST, now))
-    # refill
     tokens = min(RATE_LIMIT_BURST, tokens + (now - last) * RATE_LIMIT_RPS)
     if tokens < 1.0:
         _RL[ip] = (tokens, now)
@@ -47,7 +47,6 @@ def _rate_limit_allow(ip: str) -> bool:
 
 
 def _get_client_ip(request: Request) -> str:
-    # tries reverse-proxy header first
     xff = request.headers.get("x-forwarded-for", "")
     if xff:
         return xff.split(",")[0].strip()
@@ -80,11 +79,10 @@ def save_data():
 
 load_data()
 
-
 # ---------------------------
 # Security middleware
 # ---------------------------
-OPEN_PATHS = {"/health", "/", "/docs-info"}  # safe public pings + judge helper
+OPEN_PATHS = {"/health", "/", "/docs-info"}
 OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 
 
@@ -92,7 +90,7 @@ OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 async def api_key_middleware(request: Request, call_next):
     path = request.url.path
 
-    # 0) payload size guard (based on Content-Length when present)
+    # payload size guard (based on Content-Length when present)
     cl = request.headers.get("content-length")
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse(status_code=413, content={"error": "Payload too large"})
@@ -101,12 +99,11 @@ async def api_key_middleware(request: Request, call_next):
     if path in OPEN_PATHS or path.startswith(OPEN_PREFIXES):
         return await call_next(request)
 
-    # 1) API key check (your existing logic)
     provided = request.headers.get("x-api-key", "")
     if not API_KEY or provided != API_KEY:
         return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
-    # 2) rate limit (after auth, only for protected endpoints)
+    # rate limit only for protected endpoints
     ip = _get_client_ip(request)
     if not _rate_limit_allow(ip):
         return JSONResponse(status_code=429, content={"error": "Too many requests"})
@@ -115,7 +112,7 @@ async def api_key_middleware(request: Request, call_next):
 
 
 # ---------------------------
-# Models
+# Models (still used for local/dev)
 # ---------------------------
 class MessageIn(BaseModel):
     session_id: Optional[str] = None
@@ -124,7 +121,6 @@ class MessageIn(BaseModel):
 
 # ---------------------------
 # Scam detection + risk scoring
-# (simple + explainable)
 # ---------------------------
 KEYWORDS = {
     "high_risk": [
@@ -143,7 +139,7 @@ THRESHOLD = 50
 def analyze_risk(message: str, previous_total: int) -> Dict[str, Any]:
     score_increment = 0
     evidence: List[str] = []
-    m = message.lower()
+    m = (message or "").lower()
 
     for w in KEYWORDS["high_risk"]:
         if w in m:
@@ -155,18 +151,15 @@ def analyze_risk(message: str, previous_total: int) -> Dict[str, Any]:
             score_increment += 10
             evidence.append(f"Medium risk keyword: '{w}'")
 
-    # 10-digit phone-ish number
-    if re.search(r"\b\d{10}\b", message):
+    if re.search(r"\b\d{10}\b", message or ""):
         score_increment += 15
         evidence.append("Pattern match: 10-digit number detected")
 
-    # URL shorteners / links
     if re.search(r"(https?://|bit\.ly|tinyurl\.com|t\.me|rb\.gy)", m):
         score_increment += 20
         evidence.append("Pattern match: suspicious link detected")
 
-    # UPI-like handle
-    if re.search(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_]{2,}\b", message):
+    if re.search(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_]{2,}\b", message or ""):
         score_increment += 25
         evidence.append("Pattern match: UPI ID detected")
 
@@ -196,75 +189,48 @@ def _dedupe(items: List[str]) -> List[str]:
 
 
 def extract_intel(text: str) -> Dict[str, Any]:
-    """
-    Extract:
-    - urls: http(s) links
-    - upi_links: upi://pay?... deep links
-    - upi_ids: name@bank (tries to avoid emails)
-    - ifsc: ABCD0XXXXXX
-    - account_numbers: 9-18 digits (excluding 10-digit phones)
-    - phones: normalized digits (keeps last 10 digits if prefixed like +91)
-    - emails: valid emails
-    """
     found: Dict[str, Any] = {}
-    t = text
+    t = text or ""
 
-    # URLs
     urls = re.findall(r"https?://[^\s]+", t, flags=re.IGNORECASE)
-    urls = [u.rstrip(".,)]}!?;:") for u in urls]
-    urls = _dedupe(urls)
+    urls = _dedupe([u.rstrip(".,)]}!?;:") for u in urls])
     if urls:
         found["urls"] = urls
 
-    # UPI deep links
     upi_links = re.findall(r"\bupi://pay\?[^\s]+", t, flags=re.IGNORECASE)
-    upi_links = [u.rstrip(".,)]}!?;:") for u in upi_links]
-    upi_links = _dedupe(upi_links)
+    upi_links = _dedupe([u.rstrip(".,)]}!?;:") for u in upi_links])
     if upi_links:
         found["upi_links"] = upi_links
 
-    # Emails
-    emails = re.findall(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", t)
-    emails = _dedupe(emails)
+    emails = _dedupe(re.findall(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b", t))
     if emails:
         found["emails"] = emails
 
-    # UPI IDs (avoid emails by disallowing '.' in bank part)
     candidates = re.findall(r"\b[a-zA-Z0-9.\-_]{2,}@[a-zA-Z0-9\-_]{2,}\b", t)
     upis: List[str] = []
     for c in candidates:
         bank_part = c.split("@", 1)[1]
-        if "." not in bank_part:  # emails have domain dots
+        if "." not in bank_part:
             upis.append(c)
     upis = _dedupe(upis)
     if upis:
         found["upi_ids"] = upis
 
-    # IFSC
-    ifsc = re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", t.upper())
-    ifsc = _dedupe(ifsc)
+    ifsc = _dedupe(re.findall(r"\b[A-Z]{4}0[A-Z0-9]{6}\b", t.upper()))
     if ifsc:
         found["ifsc"] = ifsc
 
-    # Account-like numbers (exclude 10-digit phones)
     candidates = re.findall(r"\b\d{9,18}\b", t)
-    accts = [c for c in candidates if len(c) != 10]
-    accts = _dedupe(accts)
+    accts = _dedupe([c for c in candidates if len(c) != 10])
     if accts:
         found["account_numbers"] = accts
 
-    # Phones:
-    # - match +91 / 0 / spaces / hyphens, but always capture full match
-    # - normalize to last 10 digits (so +91 9876... becomes 9876...)
-    phone_matches = []
-    for m in re.finditer(r"(?:\+?\d{1,3}[\s\-]?)?\b\d{10}\b", t):
-        phone_matches.append(m.group(0))
-
+    phone_matches = [m.group(0) for m in re.finditer(r"(?:\+?\d{1,3}[\s\-]?)?\b\d{10}\b", t)]
     phones: List[str] = []
     for p in phone_matches:
         digits = re.sub(r"\D", "", p)
         if len(digits) >= 10:
-            phones.append(digits[-10:])  # keep last 10 digits
+            phones.append(digits[-10:])
     phones = _dedupe(phones)
     if phones:
         found["phones"] = phones
@@ -283,7 +249,7 @@ def merge_unique_list(dst: Dict[str, Any], key: str, items: List[str]) -> None:
 
 
 # ---------------------------
-# Agent (UPI Support persona)
+# Agent
 # ---------------------------
 def compute_stage(intel: Dict[str, Any]) -> str:
     have_upi = bool(intel.get("upi_ids"))
@@ -299,20 +265,16 @@ def compute_stage(intel: Dict[str, Any]) -> str:
 
 
 def agent_reply(stage: str, intel: Dict[str, Any]) -> str:
-    # Keep replies short + natural so scammers respond with details.
     if stage == "need_beneficiary_details":
         return (
             "Hello, UPI Support here. To verify the beneficiary, please share the UPI ID "
             "(example: name@bank) OR bank account number + IFSC."
         )
-
     if stage == "need_link":
         return (
             "Thanks. Now send the payment link/QR link you received (or a upi://pay link) "
             "so I can validate it before you proceed."
         )
-
-    # need_confirmation
     return (
         "Got it. For final verification, please confirm the beneficiary name and bank name "
         "exactly as it appears in your app (screenshot text is fine)."
@@ -329,11 +291,55 @@ def _detect_base_url(request: Request) -> str:
 
 
 # ---------------------------
+# Robust payload parsing (THIS fixes INVALID_REQUEST_BODY)
+# ---------------------------
+def _extract_message_fields(payload: Any) -> Tuple[Optional[str], str]:
+    """
+    Accepts many shapes:
+    - {"message": "...", "session_id": "..."}
+    - {"text": "..."} or {"input": "..."} etc.
+    - {} / None  -> message becomes "" (safe)
+    - plain string -> treated as message
+    """
+    if payload is None:
+        return None, ""
+
+    if isinstance(payload, str):
+        return None, payload
+
+    if isinstance(payload, dict):
+        sid = (
+            payload.get("session_id")
+            or payload.get("sessionId")
+            or payload.get("sid")
+        )
+
+        msg = (
+            payload.get("message")
+            or payload.get("text")
+            or payload.get("msg")
+            or payload.get("input")
+            or payload.get("content")
+            or ""
+        )
+
+        if not isinstance(msg, str):
+            try:
+                msg = json.dumps(msg, ensure_ascii=False)
+            except Exception:
+                msg = str(msg)
+
+        return sid, msg
+
+    # unknown type
+    return None, str(payload)
+
+
+# ---------------------------
 # Routes
 # ---------------------------
 @app.get("/")
 def root():
-    # public ping (no key) – does not expose anything sensitive
     return {"status": "ok", "service": "scam-honeypot"}
 
 
@@ -345,81 +351,53 @@ def health():
 @app.get("/docs-info")
 def docs_info(request: Request):
     base_url = _detect_base_url(request)
-
-    main_path = "/message"
-    alt_path = "/"  # some evaluators post to base URL
-
     example_request = {
         "session_id": "optional-session-id",
         "message": "KYC expired. Pay to upi://pay?pa=test@upi. https://bit.ly/pay-now."
     }
-
     curl_body = json.dumps(example_request, ensure_ascii=False)
-
     return {
         "service": "Scam Honeypot API",
         "base_url": base_url,
-        "auth": {
-            "required": True,
-            "header_name": "x-api-key",
-            "example": "x-api-key: <your-api-key>"
-        },
+        "auth": {"required": True, "header_name": "x-api-key"},
         "endpoints": [
-            {"method": "GET", "path": "/health", "purpose": "Health check"},
-            {"method": "GET", "path": "/docs-info", "purpose": "How to call this API"},
-            {"method": "POST", "path": main_path, "purpose": "Main message endpoint", "expects": example_request},
-            {"method": "POST", "path": alt_path, "purpose": "Alternate (base URL) message endpoint", "expects": example_request},
-            {"method": "GET", "path": "/session/{session_id}", "purpose": "Fetch session history + intel"},
-            {"method": "POST", "path": "/reset", "purpose": "Reset all sessions (requires API key)"},
+            {"method": "GET", "path": "/health"},
+            {"method": "GET", "path": "/docs-info"},
+            {"method": "POST", "path": "/message"},
+            {"method": "POST", "path": "/"},
+            {"method": "GET", "path": "/session/{session_id}"},
+            {"method": "POST", "path": "/reset"},
         ],
-        "sample_curl": (
-            f'curl -X POST "{base_url}{main_path}" '
-            f'-H "Content-Type: application/json" '
-            f'-H "x-api-key: <your-api-key>" '
-            f"-d '{curl_body}'"
-        ),
         "sample_powershell": (
             '$headers = @{ "x-api-key" = "<your-api-key>"; "Content-Type"="application/json" }\n'
             f"$body = '{curl_body}'\n"
-            f'Invoke-RestMethod -Method POST -Uri "{base_url}{main_path}" -Headers $headers -Body $body'
+            f'Invoke-RestMethod -Method POST -Uri "{base_url}/message" -Headers $headers -Body $body'
         ),
-        "notes": [
-            "Send scammer messages to POST /message (or POST / if evaluator uses base URL).",
-            "If session_id is omitted, the server generates one.",
-            "Intel extraction includes urls, upi_links, upi_ids, ifsc, account_numbers, phones, emails.",
-            f"Payload limit: {MAX_BODY_BYTES} bytes (Content-Length based).",
-            f"Rate limit: ~{RATE_LIMIT_RPS}/sec with burst {RATE_LIMIT_BURST} per IP on protected routes."
-        ],
-        "example_request_body": example_request
+        "example_request_body": example_request,
     }
 
 
-@app.post("/message")
-def message(payload: MessageIn):
-    session_id = payload.session_id or str(uuid.uuid4())
+def _process_message(session_id: Optional[str], message_text: str) -> Dict[str, Any]:
+    sid = session_id or str(uuid.uuid4())
 
-    history = SESSIONS.setdefault(session_id, [])
+    history = SESSIONS.setdefault(sid, [])
     intel = INTEL.setdefault(
-        session_id,
+        sid,
         {"urls": [], "upi_links": [], "upi_ids": [], "ifsc": [], "account_numbers": [], "phones": [], "emails": []},
     )
 
-    # Save incoming
-    history.append({"ts": datetime.utcnow().isoformat(), "from": "scammer", "text": payload.message})
+    history.append({"ts": datetime.utcnow().isoformat(), "from": "scammer", "text": message_text})
 
-    # Update intel
-    new_found = extract_intel(payload.message)
+    new_found = extract_intel(message_text)
     for k, v in new_found.items():
         if isinstance(v, list):
             merge_unique_list(intel, k, v)
 
-    # Risk scoring (rolling)
-    prev = int(RISK_STATE.get(session_id, 0))
-    risk = analyze_risk(payload.message, prev)
-    RISK_STATE[session_id] = int(risk["total_score"])
+    prev = int(RISK_STATE.get(sid, 0))
+    risk = analyze_risk(message_text, prev)
+    RISK_STATE[sid] = int(risk["total_score"])
 
     is_scam = detect_scam_from_risk(risk)
-
     stage = compute_stage(intel) if is_scam else "passive"
 
     if is_scam:
@@ -428,11 +406,10 @@ def message(payload: MessageIn):
         reply = "Hello. Please share the transaction reference so I can verify your payment."
 
     history.append({"ts": datetime.utcnow().isoformat(), "from": "bot", "text": reply})
-
     save_data()
 
     return {
-        "session_id": session_id,
+        "session_id": sid,
         "reply": reply,
         "turns": len(history),
         "scam_detected": is_scam,
@@ -443,10 +420,25 @@ def message(payload: MessageIn):
     }
 
 
+@app.post("/message")
+async def message_endpoint(request: Request, payload: Any = Body(default=None)):
+    # If portal sends invalid JSON/empty body, still handle safely
+    if payload is None:
+        raw = await request.body()
+        if raw:
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception:
+                payload = raw.decode("utf-8", errors="ignore")
+
+    session_id, msg = _extract_message_fields(payload)
+    return _process_message(session_id, msg)
+
+
 @app.post("/")
-def root_post(payload: MessageIn):
-    # Some evaluators post to base URL
-    return message(payload)
+async def root_post(request: Request, payload: Any = Body(default=None)):
+    # some evaluators POST to base URL
+    return await message_endpoint(request, payload)
 
 
 @app.get("/session/{session_id}")
