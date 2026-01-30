@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Body, Query
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -113,7 +113,7 @@ async def api_key_middleware(request: Request, call_next):
 
 
 # ---------------------------
-# Models
+# Models (kept for type hints only; NOT used as request body now)
 # ---------------------------
 class MessageIn(BaseModel):
     session_id: Optional[str] = None
@@ -350,11 +350,9 @@ def agent_reply(stage: str) -> str:
 
 # ---------------------------
 # Robust payload parser (portal-safe)
+# IMPORTANT: No Pydantic body used in routes, so no 422.
 # ---------------------------
-async def _parse_message_payload(request: Request, payload: Optional[MessageIn]) -> Tuple[Optional[str], str]:
-    if payload is not None and isinstance(payload.message, str) and payload.message.strip():
-        return payload.session_id, payload.message
-
+async def _parse_message_payload(request: Request) -> Tuple[Optional[str], str]:
     raw = await request.body()
     if raw:
         # Try JSON even if content-type is wrong
@@ -370,7 +368,7 @@ async def _parse_message_payload(request: Request, payload: Optional[MessageIn])
                 )
                 sid = data.get("session_id") or data.get("session") or data.get("sid")
                 if isinstance(msg, str) and msg.strip():
-                    return (sid if isinstance(sid, str) else None), msg
+                    return (sid if isinstance(sid, str) else None), msg.strip()
         except Exception:
             pass
 
@@ -463,62 +461,65 @@ def docs_info(request: Request):
             "session_id": "optional-session-id",
             "message": "KYC expired. Pay upi://pay?pa=test@upi. https://bit.ly/pay-now."
         },
+        "notes": [
+            "POST /message accepts: JSON with message/text/msg/input OR plain text body.",
+            "This prevents 422 errors from evaluator/tester payloads."
+        ],
     }
 
 
 @app.post("/message")
-async def message(request: Request, payload: Optional[MessageIn] = Body(default=None)):
-    sid, msg = await _parse_message_payload(request, payload)
+async def message(request: Request):
+    sid, msg = await _parse_message_payload(request)
     return _process_message(sid, msg)
 
 
 @app.post("/")
-async def root_post(request: Request, payload: Optional[MessageIn] = Body(default=None)):
-    sid, msg = await _parse_message_payload(request, payload)
+async def root_post(request: Request):
+    sid, msg = await _parse_message_payload(request)
     return _process_message(sid, msg)
 
 
 @app.get("/session/{session_id}")
 def get_session(session_id: str):
+    total = int(RISK_STATE.get(session_id, 0))
     return {
         "session_id": session_id,
         "turns": len(SESSIONS.get(session_id, [])),
         "history": SESSIONS.get(session_id, []),
         "intel": INTEL.get(session_id, default_intel()),
-        "risk_total": int(RISK_STATE.get(session_id, 0)),
-        "risk_level": risk_level(int(RISK_STATE.get(session_id, 0))),
+        "risk_total": total,
+        "risk_level": risk_level(total),
     }
 
 
-# ✅ NEW: intel-only view for judges
 @app.get("/intel/{session_id}")
 def get_intel(session_id: str):
+    total = int(RISK_STATE.get(session_id, 0))
     return {
         "session_id": session_id,
         "intel": INTEL.get(session_id, default_intel()),
-        "risk_total": int(RISK_STATE.get(session_id, 0)),
-        "risk_level": risk_level(int(RISK_STATE.get(session_id, 0))),
+        "risk_total": total,
+        "risk_level": risk_level(total),
     }
 
 
-# ✅ NEW: list recent sessions + intel (quick demo)
 @app.get("/intel")
 def list_recent_intel(limit: int = Query(default=20, ge=1, le=100)):
-    # “recent” = last N session_ids by insertion order (good enough for hackathon)
     session_ids = list(SESSIONS.keys())[-limit:]
     out = []
     for sid in reversed(session_ids):
+        total = int(RISK_STATE.get(sid, 0))
         out.append({
             "session_id": sid,
             "turns": len(SESSIONS.get(sid, [])),
-            "risk_total": int(RISK_STATE.get(sid, 0)),
-            "risk_level": risk_level(int(RISK_STATE.get(sid, 0))),
+            "risk_total": total,
+            "risk_level": risk_level(total),
             "intel": INTEL.get(sid, default_intel()),
         })
     return {"count": len(out), "items": out}
 
 
-# ✅ NEW: stats endpoint
 @app.get("/stats")
 def stats():
     total_sessions = len(SESSIONS)
