@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Request, Query, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -82,7 +82,7 @@ load_data()
 # ---------------------------
 # Security middleware
 # ---------------------------
-# Keep GET / public, but DO NOT leave POST / public.
+# Keep GET / public, but keep POST / protected.
 OPEN_GET_PATHS = {"/", "/health", "/docs-info"}
 OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 
@@ -96,7 +96,7 @@ async def api_key_middleware(request: Request, call_next):
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
         return JSONResponse(status_code=413, content={"status": "error", "message": "Payload too large"})
 
-    # Public GET endpoints + docs
+    # Public GET/HEAD endpoints + docs
     if request.method in ("GET", "HEAD") and (path in OPEN_GET_PATHS or path.startswith(OPEN_PREFIXES)):
         return await call_next(request)
     if path.startswith(OPEN_PREFIXES):
@@ -373,7 +373,7 @@ async def _parse_message_payload(request: Request) -> Tuple[Optional[str], str]:
         try:
             data = json.loads(raw.decode("utf-8", errors="ignore"))
             if isinstance(data, dict):
-                # ---- Evaluator format support ----
+                # Evaluator format support:
                 # sessionId: "...", message: { text: "...", sender: "...", timestamp: ... }
                 sid = (
                     data.get("sessionId")
@@ -467,6 +467,11 @@ def root():
     return {"status": "ok", "service": "scam-honeypot"}
 
 
+@app.head("/")
+def root_head():
+    return Response(status_code=200)
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "status": "up"}
@@ -510,7 +515,6 @@ def docs_info(request: Request):
 async def message(request: Request):
     sid, msg = await _parse_message_payload(request)
     out = _process_message(sid, msg)
-    # Evaluator expects ONLY these keys
     return {"status": "success", "reply": out["reply"]}
 
 
@@ -518,7 +522,6 @@ async def message(request: Request):
 async def root_post(request: Request):
     sid, msg = await _parse_message_payload(request)
     out = _process_message(sid, msg)
-    # Evaluator expects ONLY these keys
     return {"status": "success", "reply": out["reply"]}
 
 
