@@ -82,7 +82,8 @@ load_data()
 # ---------------------------
 # Security middleware
 # ---------------------------
-OPEN_PATHS = {"/health", "/", "/docs-info"}
+# Keep GET / public, but DO NOT leave POST / public.
+OPEN_GET_PATHS = {"/", "/health", "/docs-info"}
 OPEN_PREFIXES = ("/docs", "/openapi.json", "/redoc")
 
 
@@ -93,23 +94,36 @@ async def api_key_middleware(request: Request, call_next):
     # Payload size guard
     cl = request.headers.get("content-length")
     if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
-        return JSONResponse(status_code=413, content={"error": "Payload too large"})
+        return JSONResponse(status_code=413, content={"status": "error", "message": "Payload too large"})
 
-    # Public endpoints
-    if path in OPEN_PATHS or path.startswith(OPEN_PREFIXES):
+    # Public GET endpoints + docs
+    if request.method == "GET" and (path in OPEN_GET_PATHS or path.startswith(OPEN_PREFIXES)):
+        return await call_next(request)
+    if path.startswith(OPEN_PREFIXES):
         return await call_next(request)
 
-    # API key check
+    # API key check (protected endpoints)
     provided = request.headers.get("x-api-key", "")
     if not API_KEY or provided != API_KEY:
-        return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
 
     # Rate limit (protected endpoints)
     ip = _get_client_ip(request)
     if not _rate_limit_allow(ip):
-        return JSONResponse(status_code=429, content={"error": "Too many requests"})
+        return JSONResponse(status_code=429, content={"status": "error", "message": "Too many requests"})
 
     return await call_next(request)
+
+
+# ---------------------------
+# Global JSON error handler (prevents HTML/plain text)
+# ---------------------------
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"status": "error", "message": "Internal server error"},
+    )
 
 
 # ---------------------------
@@ -359,14 +373,36 @@ async def _parse_message_payload(request: Request) -> Tuple[Optional[str], str]:
         try:
             data = json.loads(raw.decode("utf-8", errors="ignore"))
             if isinstance(data, dict):
-                msg = (
-                    data.get("message")
-                    or data.get("msg")
-                    or data.get("text")
-                    or data.get("input")
-                    or ""
+                # ---- Evaluator format support ----
+                # sessionId: "...", message: { text: "...", sender: "...", timestamp: ... }
+                sid = (
+                    data.get("sessionId")
+                    or data.get("session_id")
+                    or data.get("session")
+                    or data.get("sid")
                 )
-                sid = data.get("session_id") or data.get("session") or data.get("sid")
+
+                msg = ""
+                mobj = data.get("message")
+                if isinstance(mobj, dict):
+                    msg = (
+                        mobj.get("text")
+                        or mobj.get("message")
+                        or mobj.get("msg")
+                        or ""
+                    )
+                elif isinstance(mobj, str):
+                    msg = mobj
+
+                # Backward compatibility
+                if not msg:
+                    msg = (
+                        data.get("msg")
+                        or data.get("text")
+                        or data.get("input")
+                        or ""
+                    )
+
                 if isinstance(msg, str) and msg.strip():
                     return (sid if isinstance(sid, str) else None), msg.strip()
         except Exception:
@@ -458,12 +494,14 @@ def docs_info(request: Request):
             {"method": "POST", "path": "/reset"},
         ],
         "example_request_body": {
-            "session_id": "optional-session-id",
-            "message": "KYC expired. Pay upi://pay?pa=test@upi. https://bit.ly/pay-now."
+            "sessionId": "optional-session-id",
+            "message": {"sender": "scammer", "text": "KYC expired. Pay upi://pay?pa=test@upi. https://bit.ly/pay-now.", "timestamp": 0},
+            "conversationHistory": [],
+            "metadata": {"channel": "SMS", "language": "English", "locale": "IN"},
         },
         "notes": [
-            "POST /message accepts: JSON with message/text/msg/input OR plain text body.",
-            "This prevents 422 errors from evaluator/tester payloads."
+            "POST / and POST /message accept evaluator schema (sessionId + message.text) OR legacy plain 'message'.",
+            "POST responses are constrained to {status, reply} for evaluator compatibility.",
         ],
     }
 
@@ -471,13 +509,17 @@ def docs_info(request: Request):
 @app.post("/message")
 async def message(request: Request):
     sid, msg = await _parse_message_payload(request)
-    return _process_message(sid, msg)
+    out = _process_message(sid, msg)
+    # Evaluator expects ONLY these keys
+    return {"status": "success", "reply": out["reply"]}
 
 
 @app.post("/")
 async def root_post(request: Request):
     sid, msg = await _parse_message_payload(request)
-    return _process_message(sid, msg)
+    out = _process_message(sid, msg)
+    # Evaluator expects ONLY these keys
+    return {"status": "success", "reply": out["reply"]}
 
 
 @app.get("/session/{session_id}")
