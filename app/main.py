@@ -97,7 +97,7 @@ async def api_key_middleware(request: Request, call_next):
         return JSONResponse(status_code=413, content={"status": "error", "message": "Payload too large"})
 
     # Public GET endpoints + docs
-    if request.method == "GET" and (path in OPEN_GET_PATHS or path.startswith(OPEN_PREFIXES)):
+    if request.method in ("GET", "HEAD") and (path in OPEN_GET_PATHS or path.startswith(OPEN_PREFIXES)):
         return await call_next(request)
     if path.startswith(OPEN_PREFIXES):
         return await call_next(request)
